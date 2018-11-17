@@ -1,0 +1,342 @@
+#! /usr/bin/env node
+const process = require("process");
+const path = require("path");
+const fs = require("fs");
+const vm = require("vm");
+const assert = require("assert");
+
+// asciidoc files delimit code blocks with lines of 4+ hyphens
+// Note that this script ignores comments, so we can run code
+// delimited this way, even when it is inside asciidoc comments.
+// So not all tests have to appear in the generated document.
+const BLOCKDELIM = /^----/;
+
+const INCLUDE = /^\s*include::([^[]+)\[\]\s*$/;
+
+/*
+ * We control execution of tests with asciidoc comments that look like this
+ * (Note that asciidoc comments must start at the left margin):
+ *
+ *  // testcode: off
+ *  // testcode: sandbox-id
+ *
+ * By default each block of code in the document is executed in its own
+ * fresh JS context where nothing is defined. Sometimes a code block
+ * intentionally demonstrates illegal code and it can't be run. In this
+ * case, precede the block with `// testcode: off`.
+ *
+ * Sometimes one code block will define a class or function that is then
+ * used in subsequent code blocks. In this case the blocks must run in a
+ * shared JS context so that the class or function definition in the first
+ * block can be used by the subsequent blocks. In this case, choose a name
+ * for this context (perhaps the function or class name) and use that in
+ * the comment: `// testcode: context-name`. The first time a context name
+ * is used a new context will be created, but it will be saved and re-used
+ * if it appears in a later `// testcode:` comment.
+ *
+ * A `// testcode:` comment is only valid for the block it precedes. If
+ * there is no comment between the end of one block and the start of the
+ * next (or between the start of the file and the start of the first block)
+ * then the next block will be executed in its own private context.
+ */
+const TESTCODE = /^\/\/\s*testcode:\s*(\S+)/;
+
+/*
+ * Match assertions of the form:
+ *
+ *   expr // => value
+ *
+ * or
+ *
+ *   expr // => value; commentary
+ *
+ * or
+ *
+ *   expr // => value: commentary
+ *
+ * We'll transform this into assert.deepStrictEqual(expr,value)
+ *
+ * Colons are legal in JS expressions so we only use them to end
+ * the value if the code after the // => includes a colon but no open
+ * curly brace.
+ */
+const ASSERT1 = /^\s*(.*?)\s*\/\/\s*=>\s*(.*?)\s*$/;
+const ASSERT1a = /^\s*(.*?)\s*\/\/\s*=>\s*([^;]*?)\s*(;|$)/;
+const ASSERT1b = /^\s*(.*?)\s*\/\/\s*=>\s*([^:]*?)\s*(:|$)/;
+
+/*
+ * Match JS:TDG assertions of the form:
+ *
+ *   // identifier == value
+ *
+ * or
+ *
+ *   // identifier == value; commentary
+ *
+ * When we match this, we'll add a new line to the script:
+ *
+ *   assert.deepStrictEqual(identifier, value)
+ */
+const ASSERT2 = /\/\/\s*([\w\.]+)\s*==([^;]*)(;|$)/;
+
+/*
+ * Match lines of the form:
+ *
+ *   expr // !commentary
+ *
+ * We expect lines like this to throw an exception and we transform them to:
+ *
+ *   assert.throws(() => { expr })
+ *
+ * Code may not run correctly under this transformation if expr is
+ * actually a statement instead of an expression with no side effects.
+ */
+const ASSERT3 = /^\s*(.*?)\s*\/\/\s*!/;
+
+let numAssertions = 0;
+patchedAssert = {};
+for (let key of Object.keys(assert)) {
+    patchedAssert[key] = function(...args) {
+        assert[key](...args);
+        numAssertions++;
+    };
+}
+
+function emptySandbox() {
+    return vm.createContext({
+        assert: patchedAssert
+    });
+}
+
+const sandboxes = {};
+
+function testCodeBlocks(filename) {
+    let blocks = [];
+    let currentBlock = null;
+    let mode = null;
+
+    // Read the contents of the file
+    const rawinput = fs.readFileSync(filename, "utf-8");
+
+    // Break the input into lines
+    const lines = rawinput.split("\n");
+
+    // Create a source map for these lines
+    const sourcemap = lines.map((line, number) => `${filename}:${number}`)
+
+    // Loop through the lines, looking for include directives.
+    // If we find any, splice them into the lines array and update the
+    // sourcemap array to match
+    const directory = path.dirname(filename);
+    for(let i = 0; i < lines.length; i++) {
+        let match = lines[i].match(INCLUDE);
+        if (match) {
+            let includedFile = path.join(directory, match[1]);
+            let includedText = fs.readFileSync(includedFile, "utf-8");
+            let newLines = includedText.split('\n');
+            let newSourcemap = newLines.map(
+                (l,n) => `${includedFile}:${n}`
+            );
+            lines.splice(i, 1, ...newLines);
+            sourcemap.splice(i, 1, ...newSourcemap);
+            i += newLines.length - 1; // -1 because we delete the incldue
+        }
+    }
+
+
+/*
+    // Handle include macros in the input
+    const input = rawinput.replace(INCLUDES, (line, file) => {
+        return "\n" + fs.readFileSync(path.join(directory, file), "utf-8");
+    });
+*/
+
+    // First we loop through the lines of the file, extracting the code
+    // from code blocks and building the blocks[] array. For each block we
+    // store the starting line number and the mode currently in effect.
+    lines.forEach((line, lineNumber) => {
+        let match;
+        if ((match = line.match(BLOCKDELIM))) {
+            if (currentBlock) {
+                // If we were already building a block,
+                // we've found the end of it
+                blocks.push(currentBlock);
+                currentBlock = null;
+                mode = null;
+            } else {
+                // This is the start of a new codeblock
+                currentBlock = {
+                    code: [],
+                    mode: mode,
+                    startLine: lineNumber + 1 // code starts on the next line
+                };
+            }
+        } else {
+            // If we didn't match a block delimiter, then if we're in a code
+            // block just accumulate the line of code. If we're not in a code
+            // block then look for `// testcode` comments.
+            if (currentBlock) {
+                currentBlock.code.push(line);
+            } else if ((match = line.match(TESTCODE))) {
+                mode = match[1];
+            }
+        }
+    });
+
+    // Next loop through the blocks, looking for comments that are assertions
+    // and implement the assertions with actual code.
+    // Warn if a code block that won't be run contains assertion comments.
+    blocks.forEach(block => {
+        const code = block.code;
+        for (let i = 0; i < code.length; i++) {
+            let line = code[i];
+            let match = line.match(ASSERT1);
+            if (match) {
+                if (block.mode === "off") {
+                    console.log(
+                        `Warning: ${sourcemap[block.startLine + i]}: code includes assertion comment but testcode is off`
+                    );
+                    continue;
+                }
+
+                // The value string might include a comment delimited by ; or :
+                let value = match[2];
+                if (value.includes(";")) {
+                    match = line.match(ASSERT1a);
+                } else if (value.includes(":") && !value.includes("{")) {
+                    match = line.match(ASSERT1b);
+                }
+
+                // We matched a line of the form "text // => value" and
+                // we replace it with the line
+                // "assert.deepStrictEqual(text,value)"
+                code[i] = `assert.deepStrictEqual(${match[1]}, ${
+                    match[2]
+                }, ${JSON.stringify(line)});`;
+                continue;
+            }
+
+            match = line.match(ASSERT2);
+            if (match) {
+                if (block.mode === "off") {
+                    console.log(
+                        `Warning: ${sourcemap[block.startLine + i]}: code includes assertion comment but testcode is off`
+                    );
+                    continue;
+                }
+
+                // We matched a line with a comment "// identifier == value"
+                // We adjust the line by removing the comment and replacing it
+                // with "; assert.deepStrictEqual(identifier, value);"
+                comment = line.substring(match.index);
+                code[i] =
+                    line.substring(0, match.index) +
+                    `; assert.deepStrictEqual(${match[1]}, ${
+                        match[2]
+                    }, ${JSON.stringify(comment)});`;
+                continue;
+            }
+
+            match = line.match(ASSERT3);
+            if (match) {
+                if (block.mode === "off") {
+                    console.log(
+                        `Warning: ${sourcemap[block.startLine + i]}: code includes assertion comment but testcode is off`
+                    );
+                    continue;
+                }
+
+                // We matched a line of the form "expr // !comment" and
+                // we replace it with the line "assert.throws(() => {expr})"
+                code[i] = `assert.throws(()=>{${match[1]}}, ${JSON.stringify(
+                    line
+                )});`;
+                continue;
+            }
+        }
+    });
+
+    const errors = [];
+    let blockCount = 0;
+
+    blocks.forEach(block => {
+        let sandbox, script;
+
+        // If the mode is "off" then don't run this block.
+        // This is for blocks that purposely demonstrate illegal code
+        // that can't run without errors
+        if (block.mode === "off") {
+            return;
+        }
+
+        // Get the sandbox to run the script in, creating it if necessary.
+        if (block.mode === null) {
+            sandbox = emptySandbox();
+        } else {
+            sandbox = sandboxes[block.mode];
+
+            // If there isn't a sandbox by that name, create a new one
+            // and remember it.
+            if (sandbox === undefined) {
+                sandbox = sandboxes[block.mode] = emptySandbox();
+            }
+        }
+
+        // Now, compile the blocks lines of code into a script
+        try {
+            script = new vm.Script(block.code.join("\n"), {
+                filename: filename,
+                lineOffset: block.startLine,
+                displayErrors: true,
+                timeout: 1000 // Error if test runs for more than a second
+            });
+        } catch (e) {
+            // If we got a compilation error for the code block
+            // just record it and move to the next block
+            errors.push(e);
+            return;
+        }
+
+        // If the script compiled, then we can try running it
+        try {
+            script.runInContext(sandbox);
+            blockCount++;
+        } catch (e) {
+            // If there was an error running it then an assertion failed
+            // Or something else about the code is bad.
+            errors.push(e);
+        }
+    });
+
+    console.log(
+        `${filename}: ${blockCount} code blocks and`,
+        `${numAssertions} assertions passed.`
+    );
+    if (errors.length > 0) {
+        console.log(`${filename}: ${errors.length} errors.`);
+        errors.forEach(e => {
+            console.log("------------------------------------------------");
+            // If it was an assertion error, display it in a useful way
+            if (e instanceof assert.AssertionError) {
+                let failureLocation = e.stack.split("\n")[6].substring(7);
+                let line = parseInt(failureLocation.split(':')[1]);
+                console.log(`Assertion failed at: ${sourcemap[line]}`);
+                console.log(" ", e.message);
+                console.log("Actual value:", e.actual);
+                console.log("Expected value:", e.expected);
+            } else {
+                // Otherwise display the key parts of the error, but
+                // don't display the full stack trace since that will
+                // mostly just be parts of this testcode program
+                let stack = e.stack.split("\n");
+                let line = parseInt(stack[0].split(':')[1]);
+                let details = stack.slice(1, 3).join("\n");
+                console.log(`${e.name}: ${e.message} at ${sourcemap[line]}`);
+                console.log(details);
+            }
+        });
+    }
+}
+
+const filenames = process.argv.slice(2);
+filenames.forEach(testCodeBlocks);
