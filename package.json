@@ -1,0 +1,22 @@
+{
+  "name": "asciidoc-javascript-validator",
+  "version": "0.1.0",
+  "description": "Validate JavaScript examples in AsciiDoc documents",
+  "main": "validate",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/davidflanagan/asciidoc-javascript-validator.git"
+  },
+  "author": "David Flanagan",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/davidflanagan/asciidoc-javascript-validator/issues"
+  },
+  "homepage": "https://github.com/davidflanagan/asciidoc-javascript-validator#readme",
+  "dependencies": {
+    "eslint": "^5.9.0"
+  }
+}
