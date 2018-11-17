@@ -4,6 +4,7 @@ const path = require("path");
 const fs = require("fs");
 const vm = require("vm");
 const assert = require("assert");
+const eslint = require("eslint");
 
 // asciidoc files delimit code blocks with lines of 4+ hyphens
 // Note that this script ignores comments, so we can run code
@@ -143,13 +144,9 @@ function testCodeBlocks(filename) {
         }
     }
 
-
-/*
-    // Handle include macros in the input
-    const input = rawinput.replace(INCLUDES, (line, file) => {
-        return "\n" + fs.readFileSync(path.join(directory, file), "utf-8");
-    });
-*/
+    // Look up the ESLint config options from the directory of the
+    // file being validated (or from a containing directory.
+    const eslintConfig = (new eslint.CLIEngine({})).getConfigForFile(filename);
 
     // First we loop through the lines of the file, extracting the code
     // from code blocks and building the blocks[] array. For each block we
@@ -257,6 +254,7 @@ function testCodeBlocks(filename) {
     });
 
     const errors = [];
+    const warnings = []; // for lint
     let blockCount = 0;
 
     blocks.forEach(block => {
@@ -306,14 +304,32 @@ function testCodeBlocks(filename) {
             // Or something else about the code is bad.
             errors.push(e);
         }
+
+        // Create a linter object to lint this block of code.
+        // TODO: add an asciidoc comment for turning off linting
+        // TODO: maybe also a comment for adding specific config
+        // rules for some blocks?
+        const linter = new eslint.Linter();
+
+        // NOTE: when I run the linter on code without assertions I get
+        // semicolon errors on all the lines with // => assertions.
+        // So now I'm trying it on the code with assertions in it.
+        const lint = linter.verify(block.code.join('\n'), eslintConfig);
+
+        for(const warning of lint) {
+            const location = sourcemap[block.startLine + warning.line];
+            warnings.push(
+                `${warning.message} (${warning.ruleId}) at ${location}`
+            );
+        }
     });
 
     console.log(
         `${filename}: ${blockCount} code blocks and`,
         `${numAssertions} assertions passed.`
     );
-    if (errors.length > 0) {
-        console.log(`${filename}: ${errors.length} errors.`);
+    if (errors.length > 0 || warnings.length > 0) {
+        console.log(`${filename}: ${errors.length} errors; ${warnings.length} warnings.`);
         errors.forEach(e => {
             console.log("------------------------------------------------");
             // If it was an assertion error, display it in a useful way
@@ -334,6 +350,10 @@ function testCodeBlocks(filename) {
                 console.log(`${e.name}: ${e.message} at ${sourcemap[line]}`);
                 console.log(details);
             }
+        });
+
+        warnings.forEach(warning => {
+            console.log(warning);
         });
     }
 }
