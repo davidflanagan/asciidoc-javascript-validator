@@ -40,7 +40,7 @@ const INCLUDE = /^\s*include::([^[]+)\[\]\s*$/;
  * next (or between the start of the file and the start of the first block)
  * then the next block will be executed in its own private context.
  */
-const TESTCODE = /^\/\/\s*testcode:\s*(\S+)/;
+const TESTCODE = /^\/\/\s*testcode:\s*(.+)/;
 
 /*
  * Match assertions of the form:
@@ -105,7 +105,10 @@ for (let key of Object.keys(assert)) {
 
 function emptySandbox() {
     return vm.createContext({
-        assert: patchedAssert
+        assert: patchedAssert,
+        // If the code we're testing sets module.exports
+        // we don't want an error on that.
+        module: {}
     });
 }
 
@@ -115,6 +118,7 @@ function testCodeBlocks(filename) {
     let blocks = [];
     let currentBlock = null;
     let mode = null;
+    let prelude = [];
 
     // Read the contents of the file
     const rawinput = fs.readFileSync(filename, "utf-8");
@@ -160,11 +164,13 @@ function testCodeBlocks(filename) {
                 blocks.push(currentBlock);
                 currentBlock = null;
                 mode = null;
+                prelude = [];
             } else {
                 // This is the start of a new codeblock
                 currentBlock = {
                     code: [],
                     mode: mode,
+                    prelude: prelude,
                     startLine: lineNumber + 1 // code starts on the next line
                 };
             }
@@ -175,7 +181,17 @@ function testCodeBlocks(filename) {
             if (currentBlock) {
                 currentBlock.code.push(line);
             } else if ((match = line.match(TESTCODE))) {
-                mode = match[1];
+                if (match[1].includes(' ')) {
+                    // If there are any spaces in testcode text, then
+                    // it is prelude code (like an assignment) intended to
+                    // be run before the block of code is to define needed
+                    // variables. Just push it onto an array of code to run
+                    prelude.push(match[1]);
+                } else {
+                    // If there are no spaces, then we just have a single
+                    // word like "off" or an indentifier to name a sandbox.
+                    mode = match[1];
+                }
             }
         }
     });
@@ -196,6 +212,40 @@ function testCodeBlocks(filename) {
                     continue;
                 }
 
+                // This is the string after the arrow
+                let expression = match[2];
+
+                // The string might be a valid JS expression, or it
+                // might be a JS expression followed by commentary.
+                // We'll try to compile it and if there is a syntax error
+                // then we'll chop of some of the stuff at the end and
+                // try again.
+                do {
+                    try {
+                        let s = new vm.Script(expression, {})
+                        // No compilation error, so the expression is good
+                        // and we can stop looping
+                        break;
+                    } catch(e) {
+                        // The expression was not valid, so chop of some
+                        // at the end and try again
+                        let lastColon = expression.lastIndexOf(':');
+                        let lastSemi = expression.lastIndexOf(';');
+                        let index = Math.max(lastColon, lastSemi);
+                        if (index <= 0) {
+                            // If there is nothing we can chop off, then
+                            // just break out of the loop. We know there
+                            // will be a syntax error on this assertion
+                            // but we'll deal with reporting it later on
+                            // when we actually run it.
+                            break;
+                        }
+                        expression = expression.substring(0,index);
+                    }
+                } while(expression.length > 0)
+
+
+                /*
                 // The value string might include a comment delimited by ; or :
                 let value = match[2];
                 if (value.includes(";")) {
@@ -204,11 +254,13 @@ function testCodeBlocks(filename) {
                     match = line.match(ASSERT1b);
                 }
 
+                */
+
                 // We matched a line of the form "text // => value" and
                 // we replace it with the line
                 // "assert.deepStrictEqual(text,value)"
                 code[i] = `assert.deepStrictEqual(${match[1]}, ${
-                    match[2]
+                    expression
                 }, ${JSON.stringify(line)});`;
                 continue;
             }
@@ -258,7 +310,7 @@ function testCodeBlocks(filename) {
     let blockCount = 0;
 
     blocks.forEach(block => {
-        let sandbox, script;
+        let sandbox, prelude, script;
 
         // If the mode is "off" then don't run this block.
         // This is for blocks that purposely demonstrate illegal code
@@ -280,7 +332,27 @@ function testCodeBlocks(filename) {
             }
         }
 
-        // Now, compile the blocks lines of code into a script
+        // Compile the prelude, if there is one
+        if (block.prelude.length > 0) {
+            try {
+                prelude = new vm.Script(block.prelude.join('\n'), {
+                    filename: filename,
+                    lineOffset: block.startLine - block.prelude.length - 1,
+                    displayErrors: true,
+                    timeout: 10
+                });
+            }
+            catch(e) {
+                // If we got a compilation error for the code block
+                // prelude just record it and move to the next block
+                errors.push(e);
+                return;
+            }
+        } else {
+            prelude = null;
+        }
+
+        // Next, compile the actual blocks of code into a script
         try {
             script = new vm.Script(block.code.join("\n"), {
                 filename: filename,
@@ -295,8 +367,11 @@ function testCodeBlocks(filename) {
             return;
         }
 
-        // If the script compiled, then we can try running it
+        // If the prelude and script compiled, then we can try running them
         try {
+            if (prelude) {
+                prelude.runInContext(sandbox);
+            }
             script.runInContext(sandbox);
             blockCount++;
         } catch (e) {
