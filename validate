@@ -118,7 +118,7 @@ function testCodeBlocks(filename) {
     let blocks = [];
     let currentBlock = null;
     let mode = null;
-    let prelude = [];
+    let prolog = [];
 
     // Read the contents of the file
     const rawinput = fs.readFileSync(filename, "utf-8");
@@ -152,6 +152,11 @@ function testCodeBlocks(filename) {
     // file being validated (or from a containing directory.
     const eslintConfig = (new eslint.CLIEngine({})).getConfigForFile(filename);
 
+    // Since we convert '// =>' comments into assert() calls, we need to
+    // tell eslint to allow a global assert() function.
+    eslintConfig.globals = eslintConfig.globals || {};
+    eslintConfig.globals.assert = "readonly";
+
     // First we loop through the lines of the file, extracting the code
     // from code blocks and building the blocks[] array. For each block we
     // store the starting line number and the mode currently in effect.
@@ -164,13 +169,13 @@ function testCodeBlocks(filename) {
                 blocks.push(currentBlock);
                 currentBlock = null;
                 mode = null;
-                prelude = [];
+                prolog = [];
             } else {
                 // This is the start of a new codeblock
                 currentBlock = {
                     code: [],
                     mode: mode,
-                    prelude: prelude,
+                    prolog: prolog,
                     startLine: lineNumber + 1 // code starts on the next line
                 };
             }
@@ -183,10 +188,10 @@ function testCodeBlocks(filename) {
             } else if ((match = line.match(TESTCODE))) {
                 if (match[1].includes(' ')) {
                     // If there are any spaces in testcode text, then
-                    // it is prelude code (like an assignment) intended to
+                    // it is prolog code (like an assignment) intended to
                     // be run before the block of code is to define needed
                     // variables. Just push it onto an array of code to run
-                    prelude.push(match[1]);
+                    prolog.push(match[1]);
                 } else {
                     // If there are no spaces, then we just have a single
                     // word like "off" or an indentifier to name a sandbox.
@@ -276,11 +281,15 @@ function testCodeBlocks(filename) {
 
                 // We matched a line with a comment "// identifier == value"
                 // We adjust the line by removing the comment and replacing it
-                // with "; assert.deepStrictEqual(identifier, value);"
+                // with "assert.deepStrictEqual(identifier, value);"
                 comment = line.substring(match.index);
+                let original = line.substring(0, match.index).trimRight();
+                if (!original.endsWith(';')) {
+                    original += ';'
+                }
                 code[i] =
-                    line.substring(0, match.index) +
-                    `; assert.deepStrictEqual(${match[1]}, ${
+                    original +
+                    `assert.deepStrictEqual(${match[1]}, ${
                         match[2]
                     }, ${JSON.stringify(comment)});`;
                 continue;
@@ -310,7 +319,7 @@ function testCodeBlocks(filename) {
     let blockCount = 0;
 
     blocks.forEach(block => {
-        let sandbox, prelude, script;
+        let sandbox, prolog, script;
 
         // If the mode is "off" then don't run this block.
         // This is for blocks that purposely demonstrate illegal code
@@ -332,24 +341,24 @@ function testCodeBlocks(filename) {
             }
         }
 
-        // Compile the prelude, if there is one
-        if (block.prelude.length > 0) {
+        // Compile the prolog, if there is one
+        if (block.prolog.length > 0) {
             try {
-                prelude = new vm.Script(block.prelude.join('\n'), {
+                prolog = new vm.Script(block.prolog.join('\n'), {
                     filename: filename,
-                    lineOffset: block.startLine - block.prelude.length - 1,
+                    lineOffset: block.startLine - block.prolog.length - 1,
                     displayErrors: true,
                     timeout: 10
                 });
             }
             catch(e) {
                 // If we got a compilation error for the code block
-                // prelude just record it and move to the next block
+                // prolog just record it and move to the next block
                 errors.push(e);
                 return;
             }
         } else {
-            prelude = null;
+            prolog = null;
         }
 
         // Next, compile the actual blocks of code into a script
@@ -367,10 +376,10 @@ function testCodeBlocks(filename) {
             return;
         }
 
-        // If the prelude and script compiled, then we can try running them
+        // If the prolog and script compiled, then we can try running them
         try {
-            if (prelude) {
-                prelude.runInContext(sandbox);
+            if (prolog) {
+                prolog.runInContext(sandbox);
             }
             script.runInContext(sandbox);
             blockCount++;
@@ -381,18 +390,23 @@ function testCodeBlocks(filename) {
         }
 
         // Create a linter object to lint this block of code.
-        // TODO: add an asciidoc comment for turning off linting
-        // TODO: maybe also a comment for adding specific config
-        // rules for some blocks?
         const linter = new eslint.Linter();
 
-        // NOTE: when I run the linter on code without assertions I get
-        // semicolon errors on all the lines with // => assertions.
-        // So now I'm trying it on the code with assertions in it.
-        const lint = linter.verify(block.code.join('\n'), eslintConfig);
+        // We run the linter over the prolog as well as the block
+        // so that the prolog can include eslint config comments and
+        // so that variables defined in the prolog are seen by the linter.
+        // Note that we're linting the pre-processed code where
+        // the comment assertions have been turned into assert() calls.
+        // So the linter doesn't see missing semicolons for lines of
+        // the form `expr // => expected`.
+        const lint = linter.verify(
+            block.prolog.join('\n') + '\n' + block.code.join('\n'),
+            eslintConfig);
 
         for(const warning of lint) {
-            const location = sourcemap[block.startLine + warning.line];
+            const location = sourcemap[
+                 block.startLine + warning.line - block.prolog.length
+            ];
             warnings.push(
                 `${warning.message} (${warning.ruleId}) at ${location}`
             );
