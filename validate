@@ -6,13 +6,15 @@ const vm = require("vm");
 const assert = require("assert");
 const eslint = require("eslint");
 
+
 // asciidoc files delimit code blocks with lines of 4+ hyphens
 // Note that this script ignores comments, so we can run code
 // delimited this way, even when it is inside asciidoc comments.
 // So not all tests have to appear in the generated document.
 const BLOCKDELIM = /^----/;
 
-const INCLUDE = /^\s*include::([^[]+)\[\]\s*$/;
+// A pattern to mach include macros in code blocks
+const INCLUDE = /^\s*include::([^\[]+)\[\]\s*$/;
 
 /*
  * We control execution of tests with asciidoc comments that look like this
@@ -40,7 +42,9 @@ const INCLUDE = /^\s*include::([^[]+)\[\]\s*$/;
  * next (or between the start of the file and the start of the first block)
  * then the next block will be executed in its own private context.
  */
-const TESTCODE = /^\/\/\s*testcode:\s*(.+)/;
+const TEST_DIRECTIVE = /^\/\/\s*test:(.+)/;
+const TEST_NAME = /^\/\/\s*test=(.+)/;
+const TEST_PROLOG = /^\/\/\s*test>(.+)/;
 
 /*
  * Match assertions of the form:
@@ -117,8 +121,13 @@ const sandboxes = {};
 function testCodeBlocks(filename) {
     let blocks = [];
     let currentBlock = null;
-    let mode = null;
-    let prolog = [];
+    // Accumulate config details about the next block
+    // into this object as we parse //test comments
+    let nextBlockConfig = {
+        mode: null,
+        name: null,
+        prolog: []
+    };
 
     // Read the contents of the file
     const rawinput = fs.readFileSync(filename, "utf-8");
@@ -168,35 +177,31 @@ function testCodeBlocks(filename) {
                 // we've found the end of it
                 blocks.push(currentBlock);
                 currentBlock = null;
-                mode = null;
-                prolog = [];
+                nextBlockConfig = {
+                    mode: null,
+                    name: null,
+                    prolog: []
+                };
             } else {
                 // This is the start of a new codeblock
                 currentBlock = {
+                    ...nextBlockConfig,
                     code: [],
-                    mode: mode,
-                    prolog: prolog,
                     startLine: lineNumber + 1 // code starts on the next line
                 };
             }
         } else {
             // If we didn't match a block delimiter, then if we're in a code
             // block just accumulate the line of code. If we're not in a code
-            // block then look for `// testcode` comments.
+            // block then look for `//test` comments.
             if (currentBlock) {
                 currentBlock.code.push(line);
-            } else if ((match = line.match(TESTCODE))) {
-                if (match[1].includes(' ')) {
-                    // If there are any spaces in testcode text, then
-                    // it is prolog code (like an assignment) intended to
-                    // be run before the block of code is to define needed
-                    // variables. Just push it onto an array of code to run
-                    prolog.push(match[1]);
-                } else {
-                    // If there are no spaces, then we just have a single
-                    // word like "off" or an indentifier to name a sandbox.
-                    mode = match[1];
-                }
+            } else if ((match = line.match(TEST_DIRECTIVE))) {
+                nextBlockConfig.mode = match[1].trim()
+            } else if ((match = line.match(TEST_NAME))) {
+                nextBlockConfig.name = match[1].trim()
+            } else if ((match = line.match(TEST_PROLOG))) {
+                nextBlockConfig.prolog.push(match[1].trim());
             }
         }
     });
@@ -323,21 +328,26 @@ function testCodeBlocks(filename) {
 
         // If the mode is "off" then don't run this block.
         // This is for blocks that purposely demonstrate illegal code
-        // that can't run without errors
+        // that can't run without errors.
+        // XXX: consider adding a no-lint mode that disables the linter
+        // and a no-run mode that compiles the block but does not execute it.
         if (block.mode === "off") {
             return;
         }
 
         // Get the sandbox to run the script in, creating it if necessary.
-        if (block.mode === null) {
+        // If there was no //test=id comment, then create a new anonymous
+        // sandbox. If there was a name specified, then look up (or create)
+        // a sandobox with that name
+        if (block.name === null) {
             sandbox = emptySandbox();
         } else {
-            sandbox = sandboxes[block.mode];
+            sandbox = sandboxes[block.name];
 
             // If there isn't a sandbox by that name, create a new one
             // and remember it.
             if (sandbox === undefined) {
-                sandbox = sandboxes[block.mode] = emptySandbox();
+                sandbox = sandboxes[block.name] = emptySandbox();
             }
         }
 
