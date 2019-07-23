@@ -111,6 +111,7 @@ function emptySandbox() {
     return vm.createContext({
         assert: patchedAssert,
         URL: URL,
+        URLSearchParams: URLSearchParams,
         // If the code we're testing sets module.exports
         // we don't want an error on that.
         module: {}
