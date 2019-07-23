@@ -110,8 +110,9 @@ for (let key of Object.keys(assert)) {
 function emptySandbox() {
     return vm.createContext({
         assert: patchedAssert,
-        URL: URL,
-        URLSearchParams: URLSearchParams,
+        URL, URLSearchParams,
+        setTimeout, setInterval, clearTimeout, clearInterval,
+
         // If the code we're testing sets module.exports
         // we don't want an error on that.
         module: {}
