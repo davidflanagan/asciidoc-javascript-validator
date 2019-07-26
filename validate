@@ -20,24 +20,24 @@ const INCLUDE = /^\s*include::([^\[]+)\[\]\s*$/;
  * We control execution of tests with asciidoc comments that look like this
  * (Note that asciidoc comments must start at the left margin):
  *
- *  // testcode: off
- *  // testcode: sandbox-id
+ *  // test:off
+ *  // test=sandbox-id
  *
  * By default each block of code in the document is executed in its own
  * fresh JS context where nothing is defined. Sometimes a code block
  * intentionally demonstrates illegal code and it can't be run. In this
- * case, precede the block with `// testcode: off`.
+ * case, precede the block with `// test: off`.
  *
  * Sometimes one code block will define a class or function that is then
  * used in subsequent code blocks. In this case the blocks must run in a
  * shared JS context so that the class or function definition in the first
  * block can be used by the subsequent blocks. In this case, choose a name
  * for this context (perhaps the function or class name) and use that in
- * the comment: `// testcode: context-name`. The first time a context name
+ * the comment: `// test=context-name`. The first time a context name
  * is used a new context will be created, but it will be saved and re-used
- * if it appears in a later `// testcode:` comment.
+ * if it appears in a later `// test=` comment.
  *
- * A `// testcode:` comment is only valid for the block it precedes. If
+ * A `// test:` comment is only valid for the block it precedes. If
  * there is no comment between the end of one block and the start of the
  * next (or between the start of the file and the start of the first block)
  * then the next block will be executed in its own private context.
@@ -60,14 +60,8 @@ const TEST_PROLOG = /^\/\/\s*test>(.+)/;
  *   expr // => value: commentary
  *
  * We'll transform this into assert.deepStrictEqual(expr,value)
- *
- * Colons are legal in JS expressions so we only use them to end
- * the value if the code after the // => includes a colon but no open
- * curly brace.
  */
 const ASSERT1 = /^\s*(.*?)\s*\/\/\s*=>\s*(.*?)\s*$/;
-const ASSERT1a = /^\s*(.*?)\s*\/\/\s*=>\s*([^;]*?)\s*(;|$)/;
-const ASSERT1b = /^\s*(.*?)\s*\/\/\s*=>\s*([^:]*?)\s*(:|$)/;
 
 /*
  * Match JS:TDG assertions of the form:
@@ -220,7 +214,7 @@ function testCodeBlocks(filename) {
             if (match) {
                 if (block.mode === "off") {
                     console.log(
-                        `Warning: ${sourcemap[block.startLine + i]}: code includes assertion comment but testcode is off`
+                        `Warning: ${sourcemap[block.startLine + i]}: code includes assertion comment but has test:off`
                     );
                     continue;
                 }
@@ -235,7 +229,10 @@ function testCodeBlocks(filename) {
                 // try again.
                 do {
                     try {
-                        let s = new vm.Script(expression, {})
+                        // Wrap the expression in parens before trying to
+                        // compile it because otherwise object literals aren't
+                        // legal.
+                        let s = new vm.Script(`(${expression})`, {})
                         // No compilation error, so the expression is good
                         // and we can stop looping
                         break;
@@ -258,17 +255,6 @@ function testCodeBlocks(filename) {
                 } while(expression.length > 0)
 
 
-                /*
-                // The value string might include a comment delimited by ; or :
-                let value = match[2];
-                if (value.includes(";")) {
-                    match = line.match(ASSERT1a);
-                } else if (value.includes(":") && !value.includes("{")) {
-                    match = line.match(ASSERT1b);
-                }
-
-                */
-
                 // We matched a line of the form "text // => value" and
                 // we replace it with the line
                 // "assert.deepStrictEqual(text,value)"
@@ -282,7 +268,7 @@ function testCodeBlocks(filename) {
             if (match) {
                 if (block.mode === "off") {
                     console.log(
-                        `Warning: ${sourcemap[block.startLine + i]}: code includes assertion comment but testcode is off`
+                        `Warning: ${sourcemap[block.startLine + i]}: code includes assertion comment but has test:off`
                     );
                     continue;
                 }
@@ -307,7 +293,7 @@ function testCodeBlocks(filename) {
             if (match) {
                 if (block.mode === "off") {
                     console.log(
-                        `Warning: ${sourcemap[block.startLine + i]}: code includes assertion comment but testcode is off`
+                        `Warning: ${sourcemap[block.startLine + i]}: code includes assertion comment but has test:off`
                     );
                     continue;
                 }
@@ -445,7 +431,7 @@ function testCodeBlocks(filename) {
             } else {
                 // Otherwise display the key parts of the error, but
                 // don't display the full stack trace since that will
-                // mostly just be parts of this testcode program
+                // mostly just be parts of this validate program
                 let stack = e.stack.split("\n");
                 let line = parseInt(stack[0].split(':')[1]);
                 let details = stack.slice(1, 3).join("\n");
