@@ -1,4 +1,4 @@
-#! /usr/bin/env node
+#! /usr/bin/env node --harmony-nullish --harmony-optional-chaining
 const process = require("process");
 const path = require("path");
 const fs = require("fs");
@@ -106,6 +106,7 @@ function emptySandbox() {
         assert: patchedAssert,
         URL, URLSearchParams,
         setTimeout, setInterval, clearTimeout, clearInterval,
+        require,
 
         // If the code we're testing sets module.exports
         // we don't want an error on that.
@@ -315,77 +316,79 @@ function testCodeBlocks(filename) {
     blocks.forEach(block => {
         let sandbox, prolog, script;
 
-        // If the mode is "off" then don't run this block.
+        // If the mode is "off" then don't run or lint this block.
         // This is for blocks that purposely demonstrate illegal code
         // that can't run without errors.
-        // XXX: consider adding a no-lint mode that disables the linter
-        // and a no-run mode that compiles the block but does not execute it.
         if (block.mode === "off") {
             return;
         }
 
-        // Get the sandbox to run the script in, creating it if necessary.
-        // If there was no //test=id comment, then create a new anonymous
-        // sandbox. If there was a name specified, then look up (or create)
-        // a sandobox with that name
-        if (block.name === null) {
-            sandbox = emptySandbox();
-        } else {
-            sandbox = sandboxes[block.name];
+        // If the mode is "lint" then we won't attempt to compile or run
+        // the code but we will still lint it 
+        if (block.mode !== "lint") {
+            // Get the sandbox to run the script in, creating it if necessary.
+            // If there was no //test=id comment, then create a new anonymous
+            // sandbox. If there was a name specified, then look up (or create)
+            // a sandobox with that name
+            if (block.name === null) {
+                sandbox = emptySandbox();
+            } else {
+                sandbox = sandboxes[block.name];
 
-            // If there isn't a sandbox by that name, create a new one
-            // and remember it.
-            if (sandbox === undefined) {
-                sandbox = sandboxes[block.name] = emptySandbox();
+                // If there isn't a sandbox by that name, create a new one
+                // and remember it.
+                if (sandbox === undefined) {
+                    sandbox = sandboxes[block.name] = emptySandbox();
+                }
             }
-        }
 
-        // Compile the prolog, if there is one
-        if (block.prolog.length > 0) {
+            // Compile the prolog, if there is one
+            if (block.prolog.length > 0) {
+                try {
+                    prolog = new vm.Script(block.prolog.join('\n'), {
+                        filename: filename,
+                        lineOffset: block.startLine - block.prolog.length - 1,
+                        displayErrors: true,
+                        timeout: 10
+                    });
+                }
+                catch(e) {
+                    // If we got a compilation error for the code block
+                    // prolog just record it and move to the next block
+                    errors.push(e);
+                    return;
+                }
+            } else {
+                prolog = null;
+            }
+
+            // Next, compile the actual blocks of code into a script
             try {
-                prolog = new vm.Script(block.prolog.join('\n'), {
+                script = new vm.Script(block.code.join("\n"), {
                     filename: filename,
-                    lineOffset: block.startLine - block.prolog.length - 1,
+                    lineOffset: block.startLine,
                     displayErrors: true,
-                    timeout: 10
+                    timeout: 1000 // Error if test runs for more than a second
                 });
-            }
-            catch(e) {
+            } catch (e) {
                 // If we got a compilation error for the code block
-                // prolog just record it and move to the next block
+                // just record it and move to the next block
                 errors.push(e);
                 return;
             }
-        } else {
-            prolog = null;
-        }
 
-        // Next, compile the actual blocks of code into a script
-        try {
-            script = new vm.Script(block.code.join("\n"), {
-                filename: filename,
-                lineOffset: block.startLine,
-                displayErrors: true,
-                timeout: 1000 // Error if test runs for more than a second
-            });
-        } catch (e) {
-            // If we got a compilation error for the code block
-            // just record it and move to the next block
-            errors.push(e);
-            return;
-        }
-
-        // If the prolog and script compiled, then we can try running them
-        try {
-            if (prolog) {
-                prolog.runInContext(sandbox);
+            // If the prolog and script compiled, then we can try running them
+            try {
+                if (prolog) {
+                    prolog.runInContext(sandbox);
+                }
+                script.runInContext(sandbox);
+                blockCount++;
+            } catch (e) {
+                // If there was an error running it then an assertion failed
+                // Or something else about the code is bad.
+                errors.push(e);
             }
-            script.runInContext(sandbox);
-            blockCount++;
-        } catch (e) {
-            // If there was an error running it then an assertion failed
-            // Or something else about the code is bad.
-            errors.push(e);
         }
 
         // Create a linter object to lint this block of code.
